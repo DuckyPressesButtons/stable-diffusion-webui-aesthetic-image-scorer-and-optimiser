@@ -344,7 +344,7 @@ class Script(scripts.Script):
             images += processed.images
             all_prompts += processed.all_prompts
             infotexts += processed.infotexts
-            if random.random() < remove_chance:  
+            if random.random() > remove_chance:  
                 current_prompt = add_to_prompt(current_prompt, all_tags)
             elif stuck_for > n_patience and n_patience:
                 current_prompt = add_to_prompt(first_prompt, all_tags)
