@@ -1,5 +1,21 @@
 # Aesthetic Image Scorer
 
+Extends aesthetic image scorer with a hill climbing score optimiser, which can be found in the script dropdown.
+
+To use this optimiser fill in the prompt and negative prompts, then write down a selection of prompts in either the dropdown or a prompts.csv file in your SD folder. The optimiser will iteratively attempt to improve the average score of output images by randomly adding tags from the list.
+
+Try to find settings and base prompt that doesn't generate too many black squares first.
+Black squares muck up the average score calculation, and while they're filtered, they will still significantly alter the outcome unless batch count is very high.
+
+I recommend using at least a batch count of 10 and as many steps as you have patience for for good general-purpose results.
+
+Batch count determines how many images it generates per step, Steps determines how many times it should look for a tag that improves score.
+
+Currently, only naive hill climbing and some related siblings (stochastic, random-restart) are included. Simulated annealing and genetic algorithms might be included sometime in the future(?)™
+
+A log with all prompts and average scores can be found in the log folder. There is no sane way to display the info in webui itself.
+
+
 ![](tag_group_by.png)
 
 Extension for https://github.com/AUTOMATIC1111/stable-diffusion-webui
