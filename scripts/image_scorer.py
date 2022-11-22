@@ -17,6 +17,9 @@ import clip
 import platform
 from launch import is_installed, run_pip
 from modules.generation_parameters_copypaste import parse_generation_parameters
+import math
+import csv
+import random
 
 extension_name = "Aesthetic Image Scorer"
 if platform.system() == "Windows" and not is_installed("pywin32"):
@@ -63,6 +66,7 @@ except:
 if force_cpu:
     print(f"{extension_name}: Forcing prediction model to run on CPU")
 device = "cuda" if not force_cpu and torch.cuda.is_available() else "cpu"
+
 # load the model you trained previously or the model available in this repo
 pt_state = torch.load(state_name, map_location=torch.device(device=device))
 
@@ -254,19 +258,112 @@ def on_image_saved(params: ImageSaveParams):
     elif platform.system() == "Windows":
         print(f"{extension_name}: Unable to load tagging script")
 
-class AestheticImageScorer(scripts.Script):
+def add_to_prompt(prompt, tags):
+    random_tag = random.choice(tags)
+    search_limit = 1000
+    n_searches = 0
+    while random_tag in prompt and n_searches < search_limit:
+        random_tag = random.choice(tags)
+        n_searches += 1
+    random_tag = random_tag + ","
+    prompt = prompt + random_tag
+    return prompt
+    
+def remove_from_prompt(prompt):
+    prompt = prompt.split(",")
+    if len(prompt) < 3:
+        return ""
+    prompt.remove(random.choice(prompt[:-1]))
+    return ",".join(prompt)
+    
+class Script(scripts.Script):
     def title(self):
-        return extension_name
+        return "Optimiser"
 
     def show(self, is_img2img):
-        return scripts.AlwaysVisible
+        return True
 
     def ui(self, is_img2img):
-        return []
-
-    def process(self, p):
-        pass
-
+        use_file = gr.Checkbox(label="Use file called prompts.csv", value=True)
+        prompt_txt = gr.Textbox(label="Comma separated prompt, untick the above box if used", lines=1)
+        n_steps = gr.Number(label='Steps', value=15)
+        min_improvement = gr.Number(label='Minimum score improvement to accept tag', value = 0.05)
+        n_patience = gr.Number(label="Restart if stuck for n steps, 0 = no restart", value = 0)
+        remove_chance = gr.Number(label = "Allow removing parts of user-defined prompt with n <= 1 chance", Value = 0.05)
+        return [use_file, prompt_txt, n_steps, min_improvement, n_patience, remove_chance]
+    
+    def run(self, p, use_file, prompt_txt, n_steps, min_improvement, n_patience, remove_chance):
+        n_loops = 10
+        best_score = 0
+        best_set = None
+        all_tags = []
+        if use_file:
+            with open ("prompts.csv", newline="") as f:
+                all_tags = [x for line in list(csv.reader(f)) for x in line]
+        else:
+            all_tags = prompt_txt.split(",")
+        best_prompt = ",".join([x.strip() for x in p.prompt.split(",")])
+        if best_prompt[-1] != ",":
+            best_prompt += ","
+        print(p.prompt, best_prompt)
+        print(all_tags)
+        current_prompt = best_prompt
+        first_prompt = best_prompt
+        images = []
+        all_prompts = []
+        infotexts = []
+        prompt_and_score = []
+        print("this is indeed running")
+        stuck_for = 0
+        for i in range(int(n_steps)):
+            current_score = 0
+            p.prompt = current_prompt
+            processed = process_images(p)
+            n_images = p.n_iter
+            for image in processed.images:
+                score = get_score(image)
+                if round(score, 1) == 4.6:
+                    n_images -= 1
+                else:  
+                  current_score += score
+            if n_images > 0:
+                avg_score = current_score / n_images
+            else:
+                avg_score = 1
+            print("Current score: {} \n Prompt: {}".format(avg_score, current_prompt))
+            prompt_and_score.append((current_prompt,avg_score))
+            if avg_score - min_improvement > best_score:
+                best_score = avg_score
+                best_set = processed
+                best_prompt = current_prompt
+                stuck_for = 0
+                print("New best")
+            else:
+                current_prompt = best_prompt
+                stuck_for += 1
+            images += processed.images
+            all_prompts += processed.all_prompts
+            infotexts += processed.infotexts
+            if random.random() < remove_chance:  
+                current_prompt = add_to_prompt(current_prompt, all_tags)
+            elif stuck_for > n_patience and n_patience:
+                current_prompt = add_to_prompt(first_prompt, all_tags)
+            else:
+                current_prompt = remove_from_prompt(current_prompt)
+            if not current_prompt:
+                break
+            
+        print("Best score: {} \n Prompt: {}".format(best_score, best_prompt))
+        with open("./log/optimiser_log.txt", "a") as f:
+            for (prompt, score) in prompt_and_score:
+                f.write("Average score: {}\nPrompt: {}\n".format(score, prompt))
+                f.write("\n")
+            f.write("BEST SCORE:{} \n BEST PROMPT: {} \n".format(best_score, best_prompt))
+            f.write("-------------------------------------------------------------------------\n")
+            
+        return Processed(p, images, p.seed, "", all_prompts=all_prompts, infotexts=infotexts)
+        
+        
 
 script_callbacks.on_ui_settings(on_ui_settings)
 script_callbacks.on_before_image_saved(on_before_image_saved)
