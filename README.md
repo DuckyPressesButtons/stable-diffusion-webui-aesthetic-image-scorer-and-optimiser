@@ -11,9 +11,9 @@ I recommend using at least a batch count of 10 and as many steps as you have pat
 
 Batch count determines how many images it generates per step, Steps determines how many times it should look for a tag that improves score.
 
-Currently, only naive hill climbing and some related siblings (stochastic, random-restart) are included. Simulated annealing and genetic algorithms might be included sometime in the future(?)™
-
 A log with all prompts and average scores can be found in the log folder. There is no sane way to display the info in webui itself.
+
+Currently, only greedy hill climbing and some related siblings (stochastic, random-restart) are included. Memory-assisted hill climbing, simulated annealing, genetic algorithms, generation parameters might be included sometime in the future(?)™
 
 
 ![](tag_group_by.png)
