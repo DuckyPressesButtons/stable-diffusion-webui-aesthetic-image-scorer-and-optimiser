@@ -7,7 +7,7 @@ To use this optimiser fill in the prompt and negative prompts, then write down a
 Try to find settings and base prompt that doesn't generate too many black squares first.
 Black squares muck up the average score calculation, and while they're filtered, they will still significantly alter the outcome unless batch count is very high.
 
-I recommend using at least a batch count of 10 and as many steps as you have patience for for good general-purpose results.
+I recommend using at least a batch count of 10 and as many steps as you have patience for for good general-purpose results. Single batch count optimisation is also possible with decent results, but will require a good amount of prompts.
 
 Batch count determines how many images it generates per step, Steps determines how many times it should look for a tag that improves score.
 
