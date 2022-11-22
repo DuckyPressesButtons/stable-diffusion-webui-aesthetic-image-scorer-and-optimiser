@@ -2,7 +2,7 @@
 
 Extends aesthetic image scorer with a hill climbing score optimiser, which can be found in the script dropdown.
 
-To use this optimiser fill in the prompt and negative prompts, then write down a selection of prompts in either the dropdown or a prompts.csv file in your SD folder. The optimiser will iteratively attempt to improve the average score of output images by randomly adding tags from the list.
+To use this optimiser fill in the prompt and negative prompts, then write down a selection of prompts (preferably a good amount, at least 15 or so) in either the dropdown or a prompts.csv file in your SD folder. The optimiser will iteratively attempt to improve the average score of output images by randomly adding tags from the list.
 
 Try to find settings and base prompt that doesn't generate too many black squares first.
 Black squares muck up the average score calculation, and while they're filtered, they will still significantly alter the outcome unless batch count is very high.
