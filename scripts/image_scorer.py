@@ -424,14 +424,14 @@ class Script(scripts.Script):
 
     def ui(self, is_img2img):
         use_file        = gr.Checkbox(label = "Use file called prompts.csv", value=True)
-        prompt_txt      = gr.Textbox(label = "Comma separated prompt, untick the above box if used", lines=1, placeholder="tag1,tag2,tag3")
+        prompt_txt      = gr.Textbox(label = "Comma separated prompt, untick the above box if used", lines=1, placeholder="tag1,tag2,tag3(include a tag even if only parameter optimising, it won't be used but prevents bugs)")
         n_steps         = gr.Number(label = 'Steps, total images generated = steps * batch count', value = 40)
         min_improvement = gr.Number(label = 'Minimum score improvement to accept tag', value = 0.05)
         n_patience      = gr.Number(label = "Return to initial prompt if stuck for n steps, 0 = no restart", value=10, precision = 0)
         mem_formula     = gr.Checkbox(label = "Weigh past score effects of applying a tag to future tag applications (only applies to current optimisation batch, can't be turned off yet)", value=True)
         mem_smoothing   = gr.Number(label = "Tag weight offset n > 0, higher = smaller effect of tag weight", value=0.1)
         remove_chance   = gr.Number(label = "Allow random removing instead of adding to prompt with n <= 1 chance", value = 0.3)
-        param_chance    = gr.Number(label = "Allow changing one of below sampling parameters instead of prompt with n <= 1 chance", value = 0)
+        param_chance    = gr.Number(label = "Allow changing one of below sampling parameters instead of adding or removing from prompt with n <= 1 chance", value = 0)
         allow_seed      = gr.Checkbox(label = "Seed randomisation (useful for searching good seeds, leave search string empty above, above two boxes at 0, 1 respectively and below params empty)", value = False)
         steps_param     = gr.Textbox(label = "Sampling steps", placeholder =  "min, max, step")
         cfg_param       = gr.Textbox(label = "CFG Scale", placeholder = "min, max, step")
@@ -504,22 +504,21 @@ class Script(scripts.Script):
                 else:  
                   cur_score += score
             cur_state.score = 1
-            if n_images > 0:
+            if n_images:
                 cur_score /= n_images
                 cur_state.score = cur_score
-            if i:
-                s_diff = cur_state.score - prev_state.score
-                if mode == "add":
-                    tag_weights[tag] += s_diff
-                    if s_diff > 0:
-                        tag_improvements[tag] += s_diff
-                if mode == "remove":
-                    remove_weights[tag] += cur_state.score - prev_state.score
-                    if s_diff > 0:
-                        remove_improvements[tag] += s_diff
+                if i:
+                    s_diff = cur_state.score - prev_state.score
+                    if mode == "add":
+                        tag_weights[tag] += s_diff
+                        if s_diff > 0:
+                            tag_improvements[tag] += s_diff
+                    if mode == "remove":
+                        remove_weights[tag] += cur_state.score - prev_state.score
+                        if s_diff > 0:
+                            remove_improvements[tag] += s_diff
             print(f"\nStep:{i}/{n_steps} \nCurrent score: {cur_state.score} \n Prompt: {cur_state.prompt} \n Params: {cur_state.params} \n Seed: {cur_state.seed}\n")
             prompt_and_score_and_seed_and_params.append((cur_state.prompt,cur_state.score, cur_state.seed,cur_state.params))
-            prev_state = cur_state
             if cur_score - min_improvement > best_state.score:
                 best_state = cur_state
                 stuck_for = 0
@@ -530,6 +529,7 @@ class Script(scripts.Script):
                 cur_prompt = best_state.prompt
                 cur_state = best_state
                 stuck_for += 1
+            prev_state = cur_state
             images += processed.images
             all_prompts += processed.all_prompts
             infotexts += processed.infotexts
@@ -546,15 +546,16 @@ class Script(scripts.Script):
                     did_reset = True
                     best_state = first_state
                     cur_prompt = first_state.prompt
-                if param_roll > param_chance:
-                    addables = add_to_prompt(cur_prompt, tag_weights, mem_smoothing, cur_state.visited_prompts)
-                    if addables:
-                        cur_prompt, tag = addables
-                        cur_state.visited_prompts.append(tag)
-                        mode = "add"
-                        can_do_something = True
-                        break
-                if remove_roll > remove_chance:
+                if param_roll > param_chance and param_chance < 1 and remove_chance < 1:
+                    if remove_roll > remove_chance:
+                        addables = add_to_prompt(cur_prompt, tag_weights, mem_smoothing, cur_state.visited_prompts)
+                        if addables:
+                            cur_prompt, tag = addables
+                            cur_state.visited_prompts.append(tag)
+                            mode = "add"
+                            can_do_something = True
+                            break
+                if remove_roll > remove_chance and param_chance > 0:
                     shuffled_params = copy.deepcopy(list(all_params.items()))
                     n_params = len(shuffled_params)
                     random.shuffle(shuffled_params)
@@ -627,12 +628,12 @@ class Script(scripts.Script):
         
         
         to_write = list(zip(tag_weights.keys(), tag_weights.values(), tag_improvements.values()))
-        to_write = [(tag, weight, improvement, improvement - weight, improvement / (improvement - weight)) for tag, weight, improvement in to_write]
-        write_data_to_csv("./log/optimiser", ".csv", ["tag", "weight", "total improvement", "improvement ratio"], to_write)
+        to_write = [(tag, weight, improvement, improvement - weight, improvement / (improvement - weight) if improvement-weight != 0 else 1337) for tag, weight, improvement in to_write]
+        write_data_to_csv("./log/improvement_from_add", ".csv", ["tag", "weight", "total improvement", "difference", "improvement ratio"], to_write)
         
         to_write_neg = list(zip(remove_weights.keys(), remove_weights.values(), remove_improvements.values()))
-        to_write_neg = [(tag, weight, improvement, improvement - weight, improvement / (improvement - weight)) for tag, weight, improvement in to_write_neg]
-        write_data_to_csv("./log/optimiser_remove",".csv",["tag", "weight", "total_improvement", "improvement ratio"], to_write_neg)
+        to_write_neg = [(tag, weight, improvement, improvement - weight, improvement / (improvement - weight) if improvement-weight != 0 else 1337) for tag, weight, improvement in to_write_neg]
+        write_data_to_csv("./log/improvement_from_remove",".csv",["tag", "weight", "total_improvement", "difference","improvement ratio"], to_write_neg)
         
         return Processed(p, images, p.seed, "", all_prompts=all_prompts, infotexts=infotexts)
         
