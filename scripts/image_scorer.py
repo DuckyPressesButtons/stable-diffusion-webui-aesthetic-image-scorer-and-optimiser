@@ -23,14 +23,15 @@ import random
 from logging import PlaceHolder
 from dataclasses import dataclass, field
 import collections
-from copy import deepcopy
-from scipy.cluster.hierarchy import weighted
+import copy
+from scripts.rl_utils import *
 
 
 # This is some mega janky code in general that is in bad need of rewriting...
 # Please don't look too hard at it.
 
-PARAM_NAMES = ["steps_param", "cfg_param", "denoise_param", "samplers_param"]
+
+PARAM_NAMES = ["steps", "cfg_scale", "denoising_strength", "sampler_name"]
 
 extension_name = "Aesthetic Image Scorer"
 if platform.system() == "Windows" and not is_installed("pywin32"):
@@ -89,6 +90,25 @@ predictor.eval()
 
 clip_model, clip_preprocess = clip.load("ViT-L/14", device=device)
 
+def remove_black_squares(processed):
+    to_remove = [i for i, x in enumerate(processed.images) if round(get_score(x), 1) == 4.6]
+    processed.images = [x for i, x in enumerate(processed.images) if i not in to_remove]
+    processed.all_prompts = [x for i, x in enumerate(processed.all_prompts) if i not in to_remove]
+    processed.infotexts = [x for i, x in enumerate(processed.infotexts) if i not in to_remove]
+
+def get_score(image):
+    image_features = get_image_features(image)
+    score = predictor(torch.from_numpy(image_features).to(device).float())
+    return score.item()
+
+def get_scores(images):
+    scores = []
+    for image in images:
+        score = get_score(image)
+        if round(score, 1) != 4.6:
+            scores.append(score)
+    return scores
+
 
 def get_image_features(image, device=device, model=clip_model, preprocess=clip_preprocess):
     image = preprocess(image).unsqueeze(0).to(device)
@@ -98,12 +118,6 @@ def get_image_features(image, device=device, model=clip_model, preprocess=clip_p
         image_features /= image_features.norm(dim=-1, keepdim=True)
     image_features = image_features.cpu().detach().numpy()
     return image_features
-
-
-def get_score(image):
-    image_features = get_image_features(image)
-    score = predictor(torch.from_numpy(image_features).to(device).float())
-    return score.item()
 
 class AISGroup:
     def __init__(self, name="", apply_choices=lambda choice, choice_values: {"tags": [f"{choice}_{choice_values[choice]}"]}, default=[]):
@@ -269,32 +283,8 @@ def on_image_saved(params: ImageSaveParams):
     elif platform.system() == "Windows":
         print(f"{extension_name}: Unable to load tagging script")
 
-def laplace_normalise(data, offset):
-    low = min(data)
-    return [x+abs(low)+offset for x in data]
-
-def weighted_choice(data, weights, offset = 0, formula = lambda x: x**1.5):
-    weights = laplace_normalise(weights, offset)
-    weights = [formula(x) for x in weights]
-    random_object = random.choices(data, weights)[0]
-    return random_object
-
-def prompt_to_list(prompt):
-    return prompt.split(",")
-
-def list_to_prompt(prompt):
-    if not prompt:
-        return prompt
-    prompt = ",".join(prompt)
-    if prompt[-1] != ",":
-        prompt += ","
-    return prompt
-
-def dict_to_list_tuple(dict):
-    return zip(*dict.items())
-    
-def add_to_prompt(prompt, weight_dict, offset, seen_list=None):
-    prompt_list = prompt_to_list(prompt)[:-1]
+def add_to_prompt(prompt, weight_dict, offset, seen_list=None, add_to_start = False):
+    prompt_list = prompt_to_list(prompt)
     tags, weights = zip(*weight_dict.items())
     seen_list = seen_list + prompt_list
     addables = []
@@ -308,16 +298,21 @@ def add_to_prompt(prompt, weight_dict, offset, seen_list=None):
     if addables_weights:
         random_tag = weighted_choice(addables, addables_weights, offset)
     else:
-        return False
+        return ()
     prompt = list_to_prompt(prompt_list)
-    prompt += random_tag + ","
+    if add_to_start:
+        prompt = random_tag + "," + prompt
+    else:
+        prompt += "," + random_tag 
     return (prompt, random_tag)
-    
+
+
 def remove_from_prompt(prompt, weight_dict, offset, seen_list = None):
-    prompt_list = prompt_to_list(prompt)[:-1]
+    prompt_list = prompt_to_list(prompt)
     if seen_list:
         seen_list = seen_list[:]
-    tags, weights = zip(*weight_dict.items())
+    tags = list(weight_dict.keys())
+    weights = list(weight_dict.values())
     removables = []
     removables_weights = []
     for i, word in enumerate(prompt_list):
@@ -333,30 +328,37 @@ def remove_from_prompt(prompt, weight_dict, offset, seen_list = None):
     prompt_list.remove(random_tag)
     return (list_to_prompt(prompt_list), random_tag)
 
-def pick_new_param(vals, seen_list = None):
-    return random.choice([x for x in vals if x not in seen_list])
-
 @dataclass
 class State():
-    prompt:             str = ""
-    params:             dict = field(default_factory = lambda: {"sampler_index"         : 0,
+    prompt:                 str = ""
+    neg_prompt:             str = ""
+    params:                 dict = field(default_factory = lambda: {
+                                                                "sampler_name"          : "",
                                                                 "steps"                 : 0,
                                                                 "cfg_scale"             : 0,
                                                                 "denoising_strength"    : 0
                                                                 })
-    seed:               int = 0
-    visited_prompts:    list = field(default_factory=list) 
-    visited_removed:    list = field(default_factory=list) 
-    visited_neg:        list = field(default_factory=list) 
-    visited_params:     dict = field(default_factory=dict)
-    score:              int = 0
+    seed:                   int = 0
+    visited_prompts:        list = field(default_factory=list) 
+    visited_removed:        list = field(default_factory=list) 
+    visited_neg_prompts:    list = field(default_factory=list)
+    visited_neg_removed:    list = field(default_factory=list) 
+    visited_params:         dict = field(default_factory=dict)
+    infotexts:              list = field(default_factory=list)
+    images:                 list = field(default_factory=list)
+    all_prompts:            list = field(default_factory=list)
+    score:                  int = 0
+
     
     def __post_init__(self):
         for key in self.params:
             self.visited_params[key] = [self.params[key]]
     
+    def __bool__(self):
+        return True
+
     def __hash__(self):
-        return(hash((self.prompt, self.params["sampler_index"], self.params["steps"], self.params["cfg_scale"], self.params["denoising_strength"])))
+        return(hash((self.prompt, self.neg_prompt, self.seed, self.params["sampler_name"], self.params["steps"], self.params["cfg_scale"], self.params["denoising_strength"])))
     
     def __eq__(self, other):
         if isinstance(other, State):
@@ -364,58 +366,31 @@ class State():
                 self.params["steps"] == other.params["steps"] and \
                 self.params["cfg_scale"] == other.params["cfg_scale"] and \
                 self.params["denoising_strength"] == other.params["denoising_strength"] and \
-                self.params["sampler_index"] == other.params["sampler_index"]:
+                self.params["sampler_name"] == other.params["sampler_name"]:
                 return True
             else:
                 return False
         return False
     
     def copy_p_params_to_state(self, p):
-        self.params["sampler_index"] = p.sampler_index
-        self.params["steps"] = p.steps
-        self.params["cfg_scale"] = p.cfg_scale
-        self.params["denoising_strength"] = p.denoising_strength
-        self.seed = p.seed
+        self.params["sampler_name"] = self.p.sampler_name
+        self.params["steps"] = self.p.steps
+        self.params["cfg_scale"] = self.p.cfg_scale
+        self.params["denoising_strength"] = self.p.denoising_strength
+        self.seed = self.p.seed
 
     
 def convert_state_to_p(state, p):
     p.prompt = state.prompt
+    p.negative_prompt = state.neg_prompt
     p.steps = state.params["steps"]
     p.cfg_scale = state.params["cfg_scale"]
     p.denoising_strength = state.params["denoising_strength"]
-    p.sampler_index = state.params["sampler_index"]
+    p.sampler_name = state.params["sampler_name"]
     p.seed = state.seed
     return p
-
-
-def comma_sep_to_list(c_string):
-    return [x.strip() for x in c_string.split(",")]
-
-def comma_sep_string_to_cast_tuple(c_string, f):
-    return tuple([f(x) for x in comma_sep_to_list(c_string)])
-
-def clean_string(c_string):
-    return ",".join(remove_whitespace_from_list(comma_sep_to_list(c_string)))
-
-def remove_whitespace_from_list(c_list):
-    return [x for x in c_list if x != ""]
-
-def random_from_dict(dictionary):
-    random_key = random.choice(list(dictionary.keys()))
-    return (random_key, dictionary[random_key])
-
-def frange(min, max, step):
-    n_intervals = (max-min)/step
-    if math.isclose(n_intervals, round(n_intervals)):
-        n_intervals = round(n_intervals)
-    return [x*step+min for x in range(int(n_intervals) + 1)]
     
-def find_free_filename(f_path, extension):
-    for i in range(10000):
-        if not os.path.exists(f"{f_path}{i}{extension}"):
-            return f"{f_path}{i}{extension}"
-    
-class Script(scripts.Script):
+class Script(scripts.Script):        
     def title(self):
         return "Score optimiser"    
 
@@ -423,226 +398,264 @@ class Script(scripts.Script):
         return True
 
     def ui(self, is_img2img):
-        use_file        = gr.Checkbox(label = "Use file called prompts.csv", value=True)
-        prompt_txt      = gr.Textbox(label = "Comma separated prompt, untick the above box if used", lines=1, placeholder="tag1,tag2,tag3(include a tag even if only parameter optimising, it won't be used but prevents bugs)")
-        n_steps         = gr.Number(label = 'Steps, total images generated = steps * batch count', value = 40)
-        min_improvement = gr.Number(label = 'Minimum score improvement to accept tag', value = 0.05)
-        n_patience      = gr.Number(label = "Return to initial prompt if stuck for n steps, 0 = no restart", value=10, precision = 0)
-        mem_formula     = gr.Checkbox(label = "Weigh past score effects of applying a tag to future tag applications (only applies to current optimisation batch, can't be turned off yet)", value=True)
-        mem_smoothing   = gr.Number(label = "Tag weight offset n > 0, higher = smaller effect of tag weight", value=0.1)
-        remove_chance   = gr.Number(label = "Allow random removing instead of adding to prompt with n <= 1 chance", value = 0.3)
-        param_chance    = gr.Number(label = "Allow changing one of below sampling parameters instead of adding or removing from prompt with n <= 1 chance", value = 0)
-        allow_seed      = gr.Checkbox(label = "Seed randomisation (useful for searching good seeds, leave search string empty above, above two boxes at 0, 1 respectively and below params empty)", value = False)
-        steps_param     = gr.Textbox(label = "Sampling steps", placeholder =  "min, max, step")
-        cfg_param       = gr.Textbox(label = "CFG Scale", placeholder = "min, max, step")
-        denoise_param   = gr.Textbox(label = "Denoise strength", placeholder = "min, max, step")
-        samplers_param  = gr.Textbox(label = "Samplers", placeholder = "Not yet implemented")
-        allow_punc      = gr.Checkbox(label = "Not yet implemented", value = False)
-        return [use_file, prompt_txt,n_steps, min_improvement, n_patience, mem_formula, mem_smoothing, remove_chance, param_chance, allow_seed, steps_param, cfg_param, denoise_param, samplers_param, allow_punc]
+        use_file           = gr.Checkbox(label = "Use file called prompts.csv instead of box below", value=False)
+        use_file_neg       = gr.Checkbox(label = "Use file called neg_prompts.csv instead of box below", value=False)
+        tags_txt           = gr.Textbox(label = "Comma separated prompt, untick the above box if used", lines=1, placeholder="tag1,tag2,tag3(include a tag even if only parameter optimising, it won't be used but prevents bugs)")
+        neg_tags_txt       = gr.Textbox(label = "Comma separated negative prompt", lines = 1, placeholder = "tag1,tag2,tag3")
+        n_steps            = gr.Number(label = 'Numbers of epochs, total images generated = epochs * batch count', value = 40, precision = 0)
+        min_improvement    = gr.Number(label = 'Minimum score improvement to accept tag', value = 0.05)
+        n_patience         = gr.Number(label = "Return to initial prompt if stuck for n steps, 0 = no restart", value=10, precision = 0)
+        mem_smoothing      = gr.Number(label = "Tag weight offset n > 0, higher = smaller effect of tag weight", value=0.1)
+        add_to_start       = gr.Checkbox(label = "Add to start of prompt instead of end", value = False)
+        add_chance         = gr.Number(label = "Relative weight of: adding to prompt, 0 = off", value = 3)
+        remove_chance      = gr.Number(label = "... removing from prompt", value = 1)
+        neg_add_chance     = gr.Number(label = "... adding to neg prompt", value = 0)
+        neg_remove_chance  = gr.Number(label = "... removing from neg prompt", value = 0)
+        param_chance       = gr.Number(label = "... parameter modification", value = 0)
+        seed_change_chance = gr.Number(label = "... seed randomisation", value = 0)
+        steps_param        = gr.Textbox(label = "Sampling steps, empty = off for all params", placeholder =  "min, max, step")
+        cfg_param          = gr.Textbox(label = "CFG Scale", placeholder = "min, max, step")
+        denoise_param      = gr.Textbox(label = "Denoise strength", placeholder = "min, max, step")
+        samplers_param     = gr.Textbox(label = "Samplers", placeholder = "some_sampler, another_sampler")
+        punc_steps         = gr.Number(label = "Amount of punctuation hacking steps", number = 0)
+        return [use_file, use_file_neg, tags_txt, neg_tags_txt, n_steps, min_improvement, n_patience, mem_smoothing, add_to_start, add_chance, remove_chance,
+                    neg_add_chance, neg_remove_chance, param_chance, seed_change_chance, steps_param, cfg_param, denoise_param, samplers_param,punc_steps]
     
-    
-    def run(self, p, use_file, prompt_txt, n_steps, min_improvement, n_patience, mem_formula, mem_smoothing, remove_chance, param_chance, allow_seed, steps_param, cfg_param, denoise_param, samplers_param, allow_punc):
-        random_seed = random.randint(0, 2**32-1)
-        all_tags = []
-        if use_file:
-            with open ("prompts.csv", newline="") as f:
-                all_tags = [x for line in list(csv.reader(f)) for x in line]
-        else:
-            all_tags = prompt_txt.split(",")
-        all_tags = remove_whitespace_from_list(all_tags)
-        init_params = {"steps"              : steps_param,
-                      "cfg_scale"           : cfg_param,
-                      "denoising_strength"  : denoise_param}
-        all_params = {}
-        for param, val in init_params.items():
-            if val == "":
-                continue
-            if param in ["steps", "sampler_index"]:
-                all_params[param] = comma_sep_string_to_cast_tuple(val, int)
-            else:
-                all_params[param] = comma_sep_string_to_cast_tuple(val, float)
-        cur_prompt = clean_string(p.prompt)
-        if cur_prompt[-1] != ",":
-            cur_prompt += ","
-        images = []
-        all_prompts = []
-        infotexts = []
-        prompt_and_score_and_seed_and_params = []
-        stuck_for = 0
-        tag = ""
-        tag_weights = {x:0 for x in all_tags}
-        tag_improvements = {x:0 for x in all_tags}
-        remove_weights = {x:0 for x in all_tags + prompt_to_list(cur_prompt)}
-        remove_improvements = {x:0 for x in all_tags + prompt_to_list(cur_prompt)}
-        mode = "none"
-        first_state = State(cur_prompt)
-        first_params = {}
+    def run(self, p, *args):
+        params = ["use_file", "use_file_neg", "tags_txt", "neg_tags_txt", "n_steps", "min_improvement", "n_patience", "mem_smoothing", "add_to_start", "add_chance", "remove_chance",
+                    "neg_add_chance", "neg_remove_chance", "param_chance", "seed_change_chance", "steps_param", "cfg_param", "denoise_param", "samplers_param","punc_steps"]
+        self.__dict__.update(dict(zip(params, args)))
         if p.seed == -1:
-            p.seed = random_seed
-        for param in ["sampler_index", "steps", "cfg_scale", "denoising_strength"]:
-            if param in all_params:
-                first_params[param] = all_params[param][0]
+            p.seed = random.randint(0, 2**32-1)
+        stuck_for = 0
+        self.all_params = self.init_params()
+        self.all_weights, self.all_improvements = self.init_weights(p)
+        first_params = {}
+        for param in PARAM_NAMES:
+            if param in self.all_params:
+                first_params[param] = self.all_params[param][0]
             else:
                 exec(f"first_params[param] = p.{param}")
-        first_state = State(cur_prompt, first_params, p.seed)
+        first_state = State(p.prompt, p.negative_prompt, first_params, p.seed)
         p = convert_state_to_p(first_state, p)
         cur_state = first_state
         best_state = first_state
-        p.prompt = cur_prompt
-        new_best = False
-        did_reset = False
-        done = False
-        overall_best_state = first_state
-        for i in range(int(n_steps)):
-            n_images = p.n_iter
-            cur_score = 0
+        all_states = []
+        all_scores = []
+        for i in range(self.n_steps):
             processed = process_images(p)
-            for image in processed.images:
-                score = get_score(image)
-                if round(score, 1) == 4.6:
-                    n_images -= 1
-                else:  
-                  cur_score += score
+            remove_black_squares(processed)
+            scores = get_scores(processed.images)
+            all_scores.extend(scores)
+            n_images = len(scores)
             cur_state.score = 1
             if n_images:
-                cur_score /= n_images
+                cur_score = sum(scores) / n_images
                 cur_state.score = cur_score
                 if i:
-                    s_diff = cur_state.score - prev_state.score
-                    if mode == "add":
-                        tag_weights[tag] += s_diff
-                        if s_diff > 0:
-                            tag_improvements[tag] += s_diff
-                    if mode == "remove":
-                        remove_weights[tag] += cur_state.score - prev_state.score
-                        if s_diff > 0:
-                            remove_improvements[tag] += s_diff
-            print(f"\nStep:{i}/{n_steps} \nCurrent score: {cur_state.score} \n Prompt: {cur_state.prompt} \n Params: {cur_state.params} \n Seed: {cur_state.seed}\n")
-            prompt_and_score_and_seed_and_params.append((cur_state.prompt,cur_state.score, cur_state.seed,cur_state.params))
-            if cur_score - min_improvement > best_state.score:
+                    self.update_weights(cur_state, prev_state, mode, tag)
+            self.print_epoch_data(i, cur_state)
+            all_states.append(cur_state)
+            cur_state.infotexts = [info + f"\nScore:{scores[i]}" for i, info in enumerate(processed.infotexts)]
+            cur_state.images = processed.images
+            if cur_state.score - self.min_improvement > best_state.score:
                 best_state = cur_state
                 stuck_for = 0
                 print("New best \n")
-                if cur_score - min_improvement > overall_best_state.score:
-                    overall_best_state = cur_state
             else:
-                cur_prompt = best_state.prompt
                 cur_state = best_state
                 stuck_for += 1
-            prev_state = cur_state
-            images += processed.images
-            all_prompts += processed.all_prompts
-            infotexts += processed.infotexts
-            prompt_length = len(prompt_to_list(cur_prompt))
-            param_roll = random.random()
-            remove_roll = random.random()
-            tried_all = False
-            can_do_something = False
-            while True:
-                if stuck_for > n_patience and n_patience:
-                    cur_state = first_state
-                    p = convert_state_to_p(cur_state, p)
-                    stuck_for = 0
-                    did_reset = True
-                    best_state = first_state
-                    cur_prompt = first_state.prompt
-                if param_roll > param_chance and param_chance < 1 and remove_chance < 1:
-                    if remove_roll > remove_chance:
-                        addables = add_to_prompt(cur_prompt, tag_weights, mem_smoothing, cur_state.visited_prompts)
-                        if addables:
-                            cur_prompt, tag = addables
-                            cur_state.visited_prompts.append(tag)
-                            mode = "add"
-                            can_do_something = True
-                            break
-                if remove_roll > remove_chance and param_chance > 0:
-                    shuffled_params = copy.deepcopy(list(all_params.items()))
-                    n_params = len(shuffled_params)
-                    random.shuffle(shuffled_params)
-                    new_param_dict = copy.deepcopy(cur_state.params)
-                    if allow_seed and random.random() < (1 / (len(all_params) + 1)):
-                        cur_state = State(cur_prompt, new_param_dict, random.randint(0, 2**32-1))
-                        cur_state.set_visited_defaults
-                        p = convert_state_to_p(cur_state, p)
-                        mode = "seed"
-                        can_do_something = True
-                        break
-                    else:
-                        for i in range(n_params):
-                            param, param_interval = shuffled_params.pop()
-                            possible_param_vals = frange(*param_interval)
-                            if len(possible_param_vals) == len(cur_state.visited_params[param]):
-                                continue
-                            new_param_val = pick_new_param(possible_param_vals, cur_state.visited_params[param])
-                            new_param_dict[param] = new_param_val
-                            cur_state.visited_params[param].append(new_param_val)
-                            already_visited_param = cur_state.visited_params[param][:]
-                            cur_state = State(cur_prompt, new_param_dict, prev_state.seed)
-                            cur_state.visited_params[param] = list(set(cur_state.visited_params[param] + already_visited_param))
-                            p = convert_state_to_p(cur_state, p)
-                            mode = "param"
-                            can_do_something = True
-                            tag = param
-                            break
-                        if can_do_something:
-                            break
-                if prompt_length > 2 and len(cur_state.visited_removed) < prompt_length and remove_chance > 0:
-                    removables = remove_from_prompt(cur_prompt, remove_weights, mem_smoothing, cur_state.visited_removed)
-                    if removables:
-                        cur_prompt, tag = removables
-                        cur_state.visited_removed.append(tag)
-                        mode = "remove"
-                        can_do_something = True
-                        break
-                if not tried_all:
-                    param_roll = 0.999
-                    remove_roll = 0.999
-                    tried_all = True
-                    continue
-                if n_patience and not did_reset:
-                    stuck_for = n_patience + 1
-                    continue
-                else:
-                    print("ran out of tunable params")
-                    done = True
-                    break
+            if (successor := self.get_successor_state(cur_state)) and (stuck_for < self.n_patience or not self.n_patience):
+                prev_state = cur_state
+                cur_state, mode, tag = successor
+                convert_state_to_p(cur_state, p)
+            elif (successor := self.get_successor_state(first_state)) and self.n_patience:
+                stuck_for = 0
+                prev_state = first_state
+                cur_state, mode, tag = successor
+                convert_state_to_p(cur_state, p)
+            else:
                 break
-            if done:
-                break
-            tried_all = False
-            did_reset = False
-            if mode not in ["param", "seed"]:
-                cur_state = State(cur_prompt, prev_state.params, prev_state.seed)
-                if mode == "add":
-                    cur_state.visited_removed.append(tag)
-                p = convert_state_to_p(cur_state, p)
-            
-        print("Best score: {} \n Prompt: {}".format(overall_best_state.score, overall_best_state.prompt, overall_best_state.params))
-        f_path = find_free_filename("./log/optimiser_log", ".txt")
-        with open(f_path, "w") as f:
-            for (prompt, score, seed, params) in prompt_and_score_and_seed_and_params:
-                f.write("Average score: {}\n Prompt: {}\n Params: seed:{}{}\n".format(score, prompt, seed, params))
-                f.write("\n")
-            f.write("BEST SCORE:{} \n BEST PROMPT: {} \n BEST PARAMS: seed {} {}\n".format(overall_best_state.score, overall_best_state.prompt, overall_best_state.seed, overall_best_state.params))
-            f.write("-------------------------------------------------------------------------\n")
-        
-        
-        to_write = list(zip(tag_weights.keys(), tag_weights.values(), tag_improvements.values()))
-        to_write = [(tag, weight, improvement, improvement - weight, improvement / (improvement - weight) if improvement-weight != 0 else 1337) for tag, weight, improvement in to_write]
-        write_data_to_csv("./log/improvement_from_add", ".csv", ["tag", "weight", "total improvement", "difference", "improvement ratio"], to_write)
-        
-        to_write_neg = list(zip(remove_weights.keys(), remove_weights.values(), remove_improvements.values()))
-        to_write_neg = [(tag, weight, improvement, improvement - weight, improvement / (improvement - weight) if improvement-weight != 0 else 1337) for tag, weight, improvement in to_write_neg]
-        write_data_to_csv("./log/improvement_from_remove",".csv",["tag", "weight", "total_improvement", "difference","improvement ratio"], to_write_neg)
-        
+        self.log_data(all_states, all_scores, p.n_iter*p.batch_size)
+        all_states.sort(reverse = True, key = lambda x: x.score)
+        overall_best_state = all_states[0]
+        print(f"Best score: {overall_best_state.score} \n Prompt: {overall_best_state.prompt} \n Neg_prompt: {overall_best_state.params}")
+        images = flatten([state.images for state in all_states])
+        all_prompts = flatten(multiply_list([state.prompt for state in all_states], p.n_iter*p.batch_size))
+        infotexts = flatten([state.infotexts for state in all_states])
         return Processed(p, images, p.seed, "", all_prompts=all_prompts, infotexts=infotexts)
+
+    def update_weights(self, state, prev_state, mode, tag):
+        s_diff = state.score - prev_state.score
+        if mode != "seed":
+            self.all_weights[mode][tag] += s_diff
+            if s_diff > 0:
+                self.all_improvements[mode][tag] += s_diff
+
+    def log_data(self,all_states, all_scores, n_iter):
+        step_list = multiply_list(list(range(self.n_steps)), n_iter)
+        prompt_list = multiply_list([state.prompt for state in all_states], n_iter)
+        neg_prompt_list = multiply_list([state.neg_prompt for state in all_states], n_iter)
+        cfg_list = multiply_list([state.params["cfg_scale"] for state in all_states], n_iter)
+        sampling_steps_list = multiply_list([state.params["steps"] for state in all_states], n_iter)
+        denoise_list = multiply_list([state.params["denoising_strength"] for state in all_states], n_iter)
+        seed_list = multiply_list([state.seed for state in all_states], n_iter)
+        add_list = flatten([list(range(n_iter)) * self.n_steps])
+        seed_list = [x + y for x, y in zip(seed_list, add_list)]
+        score_list = all_scores
+        batch_score_list = multiply_list([state.score for state in all_states],n_iter)
+        to_write = list(zip(step_list, prompt_list, neg_prompt_list, cfg_list, sampling_steps_list, denoise_list, seed_list, score_list, batch_score_list))
+        write_data_to_csv("./log/optimiser_log", ".csv", ["step", "prompt", "neg_prompt", "cfg", "sampling_steps", "denoise", "seed", "score", "batch_score"], to_write)
+        for action, weights in self.all_weights.items():
+            to_write = list(zip(weights.keys(), weights.values(), self.all_improvements[action].values()))
+            to_write = [(tag, weight, improvement, improvement - weight, improvement / (improvement - weight) if improvement-weight != 0 else 1337) for tag, weight, improvement in to_write]
+            write_data_to_csv(f"./log/{action}", ".csv", ["tag", "weight", "total improvement", "difference", "improvement ratio"], to_write)
         
-def write_data_to_csv(f_path, extension, header, data):
-    f_path = find_free_filename(f_path, extension)
-    with open(f_path, "w", newline = "") as f:
-        writer = csv.writer(f)
-        writer.writerow(header)
-        writer.writerows(data)
+    def init_params(self):
+        all_params = {}
+        param_vals = [self.steps_param, self.cfg_param, self.denoise_param, self.samplers_param]
+        for param, val in zip(PARAM_NAMES, param_vals):
+            if val == "":
+                continue
+            if param == "steps":
+                all_params[param] = list(range(*comma_sep_string_to_cast_tuple(val, int)))
+            elif param == "sampler_name":
+                all_params[param] = comma_sep_to_list(clean_string(val))
+            else:
+                all_params[param] = frange(*comma_sep_string_to_cast_tuple(val, float))
+        return all_params
+
+    def init_weights(self, p):
+        all_tags = []
+        all_neg_tags = []
+        if self.add_chance:
+            if self.use_file:
+                with open ("prompts.csv", newline="") as f:
+                    all_tags = [x for line in list(csv.reader(f)) for x in line]
+            else:
+                all_tags = self.tags_txt.split(",")
+        if self.neg_add_chance:
+            if self.use_file_neg:
+                with open ("neg_prompts.csv", newline="") as f:
+                    all_neg_tags = [x for line in list(csv.reader(f)) for x in line]
+            else:
+                all_neg_tags = self.neg_tags_txt.split(",")
+        all_tags = remove_whitespace_from_list(all_tags)
+        all_neg_tags = remove_whitespace_from_list(all_neg_tags)
+        prompt_add_weights = {x:0 for x in all_tags}
+        prompt_add_improvements = {x:0 for x in all_tags}
+        prompt_remove_weights = {x:0 for x in all_tags + prompt_to_list(p.prompt)}
+        prompt_remove_improvements = {x:0 for x in all_tags + prompt_to_list(p.prompt)}
+        neg_prompt_add_weights = {x:0 for x in all_neg_tags}
+        neg_prompt_add_improvements = {x:0 for x in all_neg_tags}
+        neg_prompt_remove_weights = {x:0 for x in all_neg_tags + prompt_to_list(p.negative_prompt)}
+        neg_prompt_remove_improvements = {x:0 for x in all_neg_tags + prompt_to_list(p.negative_prompt)}
+        param_weights = [collections.Counter() for param in PARAM_NAMES]
+        param_improvements = [collections.Counter() for param in PARAM_NAMES]
+        modes = ["prompt_add", "prompt_remove", "neg_prompt_add", "neg_prompt_remove"] + PARAM_NAMES
+        weights = [prompt_add_weights, prompt_remove_weights, neg_prompt_add_weights, neg_prompt_remove_weights] + param_weights
+        improvements = [prompt_add_improvements, prompt_remove_improvements, neg_prompt_add_improvements, neg_prompt_remove_improvements] + param_improvements
+        all_weights = dict(zip(modes, weights))
+        all_improvements = dict(zip(modes, improvements))
+        return (all_weights, all_improvements)
+
+    def print_epoch_data(self, i, state):
+        print(f"\nStep:{i}/{self.n_steps} \nCurrent score: {state.score} \n Prompt: {state.prompt} \n Negative Prompt: {state.neg_prompt} \n Params: {state.params} \n Seed: {state.seed}\n")
+
+    def get_successor_state(self, state):
+        if can_do_action := self.find_valid_action(state):
+            mode, result, tag = can_do_action
+        else:
+            return ()
+        new_param_dict = copy.deepcopy(state.params)
+        new_state = State(state.prompt, state.neg_prompt, new_param_dict, state.seed)
+        if mode in PARAM_NAMES:
+            new_param_dict[tag] = result
+            new_state.visited_params[tag].append(result)
+            already_visited_param = new_state.visited_params[tag][:]
+            new_state = State(state.prompt, state.neg_prompt, new_param_dict, state.seed)
+            new_state.visited_params[tag] = list(set(new_state.visited_params[tag] + already_visited_param))
+        if mode == "seed":
+            new_state.seed = result
+        if mode == "prompt_add":
+            new_state.visited_removed.append(tag)
+            new_state.prompt = result
+        if mode == "neg_prompt_add":
+            new_state.visited_neg_removed.append(tag)
+            new_state.neg_prompt = result
+        if mode == "prompt_remove":
+            new_state.prompt = result
+        if mode == "neg_prompt_remove":
+            new_state.neg_prompt = result
+        return (new_state, mode, tag)
+
+    def find_valid_action(self, state):
+        actions = [self.prompt_add, self.prompt_remove, self.param_change, self.neg_prompt_add, self.neg_prompt_remove, self.seed_change]
+        actions_chances = [self.add_chance, self.remove_chance, self.param_chance, self.neg_add_chance, self.neg_remove_chance, self.seed_change_chance]
+        if not sum(actions_chances):
+            actions_chances[0] = 1
+        possible_actions = []
+        first_action = random.choices(actions, actions_chances)[0]
+        possible_actions = [x for i, x in enumerate(actions) if actions_chances[i] != 0 and x != first_action]
+        random.shuffle(possible_actions)
+        possible_actions = [first_action] + possible_actions
+        for action in possible_actions:
+            if result := action(state):
+                return result
+        return ()
+    
+    def prompt_add(self, state):
+        addables = add_to_prompt(state.prompt, self.all_weights["prompt_add"], self.mem_smoothing, state.visited_prompts, self.add_to_start)
+        if addables:
+            prompt, tag = addables
+            state.visited_prompts.append(tag)
+            return ("prompt_add", prompt, tag)
+        return ()
+
+    def neg_prompt_add(self, state):
+        addables = add_to_prompt(state.neg_prompt, self.all_weights["neg_prompt_add"], self.mem_smoothing, state.visited_neg_prompts, self.add_to_start)
+        if addables:
+            neg_prompt, tag = addables
+            state.visited_neg_prompts.append(tag)
+            return ("neg_prompt_add", neg_prompt, tag)
+        return ()
+
+    def prompt_remove(self, state):
+        if prompt_length(state.prompt) > 2 and len(state.visited_removed) < prompt_length(state.prompt):
+            removables = remove_from_prompt(state.prompt, self.all_weights["prompt_remove"], self.mem_smoothing, state.visited_removed)
+            if removables:
+                prompt, tag = removables
+                state.visited_removed.append(tag)
+                return ("prompt_remove", prompt, tag)
+        return ()
+
+    def neg_prompt_remove(self, state):
+        if prompt_length(state.neg_prompt) > 2 and len(state.visited_neg_removed) < prompt_length(state.neg_prompt):
+            removables = remove_from_prompt(state.neg_prompt, self.all_weights["neg_prompt_remove"], self.mem_smoothing, state.visited_neg_removed)
+            if removables:
+                neg_prompt, tag = removables
+                state.visited_neg_removed.append(tag)
+                return ("neg_prompt_remove", neg_prompt, tag)
+        return ()
+
+    def param_change(self, state):
+        shuffled_params = copy.deepcopy(list(self.all_params.items()))
+        n_params = len(shuffled_params)
+        random.shuffle(shuffled_params)
+        for i in range(n_params):
+            param, possible_param_vals = shuffled_params.pop()
+            if len(possible_param_vals) == len(state.visited_params[param]):
+                continue
+            new_param_val = pick_unique(possible_param_vals, state.visited_params[param])
+            return (param, new_param_val, param)
+        return ()
+
+    def seed_change(self, state):
+        new_seed = random.randint(0, 2**32-1)
+        return ("seed", new_seed, new_seed)
+
+    def punc_hack(self):
+        pass
 
 script_callbacks.on_ui_settings(on_ui_settings)
 script_callbacks.on_before_image_saved(on_before_image_saved)
