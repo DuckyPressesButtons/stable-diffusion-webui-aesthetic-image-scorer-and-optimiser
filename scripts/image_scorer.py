@@ -443,6 +443,7 @@ class Script(scripts.Script):
         all_states = []
         all_scores = []
         for i in range(self.n_steps):
+            print(cur_state.visited_params)
             processed = process_images(p)
             remove_black_squares(processed)
             scores = get_scores(processed.images)
@@ -450,8 +451,7 @@ class Script(scripts.Script):
             n_images = len(scores)
             cur_state.score = 1
             if n_images:
-                cur_score = sum(scores) / n_images
-                cur_state.score = cur_score
+                cur_state.score = sum(scores) / n_images
                 if i:
                     self.update_weights(cur_state, prev_state, mode, tag)
             self.print_epoch_data(i, cur_state)
@@ -465,11 +465,12 @@ class Script(scripts.Script):
             else:
                 cur_state = best_state
                 stuck_for += 1
-            if (successor := self.get_successor_state(cur_state)) and (stuck_for < self.n_patience or not self.n_patience):
+            if (stuck_for < self.n_patience or not self.n_patience) and (successor := self.get_successor_state(cur_state)):
+                print("can_find")
                 prev_state = cur_state
                 cur_state, mode, tag = successor
                 convert_state_to_p(cur_state, p)
-            elif (successor := self.get_successor_state(first_state)) and self.n_patience:
+            elif self.n_patience and (successor := self.get_successor_state(first_state)):
                 stuck_for = 0
                 prev_state = first_state
                 cur_state, mode, tag = successor
@@ -563,6 +564,7 @@ class Script(scripts.Script):
         print(f"\nStep:{i}/{self.n_steps} \nCurrent score: {state.score} \n Prompt: {state.prompt} \n Negative Prompt: {state.neg_prompt} \n Params: {state.params} \n Seed: {state.seed}\n")
 
     def get_successor_state(self, state):
+        print(state.visited_params)
         if can_do_action := self.find_valid_action(state):
             mode, result, tag = can_do_action
         else:
@@ -570,22 +572,24 @@ class Script(scripts.Script):
         new_param_dict = copy.deepcopy(state.params)
         new_state = State(state.prompt, state.neg_prompt, new_param_dict, state.seed)
         if mode in PARAM_NAMES:
-            new_param_dict[tag] = result
-            new_state.visited_params[tag].append(result)
-            already_visited_param = new_state.visited_params[tag][:]
-            new_state = State(state.prompt, state.neg_prompt, new_param_dict, state.seed)
-            new_state.visited_params[tag] = list(set(new_state.visited_params[tag] + already_visited_param))
+            state.visited_params[tag] += [result]
+            new_state.visited_params[tag] = state.visited_params[tag]
+            new_state.params[mode] = result
         if mode == "seed":
             new_state.seed = result
         if mode == "prompt_add":
+            state.visited_prompts.append(tag)
             new_state.visited_removed.append(tag)
             new_state.prompt = result
         if mode == "neg_prompt_add":
+            state.visited_neg_prompts.append(tag)
             new_state.visited_neg_removed.append(tag)
             new_state.neg_prompt = result
         if mode == "prompt_remove":
+            state.prompt_removed.append(tag)
             new_state.prompt = result
         if mode == "neg_prompt_remove":
+            state.neg_prompt_removed.append(tag)
             new_state.neg_prompt = result
         return (new_state, mode, tag)
 
@@ -646,6 +650,7 @@ class Script(scripts.Script):
             param, possible_param_vals = shuffled_params.pop()
             if len(possible_param_vals) == len(state.visited_params[param]):
                 continue
+            print(possible_param_vals, state.visited_params[param])
             new_param_val = pick_unique(possible_param_vals, state.visited_params[param])
             return (param, new_param_val, param)
         return ()
