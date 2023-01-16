@@ -25,6 +25,8 @@ from dataclasses import dataclass, field
 import collections
 import copy
 from scripts.rl_utils import *
+import requests
+import re
 
 
 # This is some mega janky code in general that is in bad need of rewriting...
@@ -45,11 +47,23 @@ except:
 state_name = "sac+logos+ava1-l14-linearMSE.pth"
 if not Path(state_name).exists():
     url = f"https://github.com/christophschuhmann/improved-aesthetic-predictor/blob/main/{state_name}?raw=true"
-    import requests
     r = requests.get(url)
     with open(state_name, "wb") as f:
         f.write(r.content)
 
+prompt_name = "prompts.csv"
+if not Path(prompt_name).exists():
+    url = f"https://github.com/DuckyPressesButtons/stable-diffusion-webui-aesthetic-image-scorer-and-optimiser/blob/main/scripts/prompts.csv?raw=true"
+    r = requests.get(url)
+    with open(prompt_name, "wb") as f:
+        f.write(r.content)
+
+neg_prompt_name = "neg_prompts.csv"
+if not Path(neg_prompt_name).exists():
+    url = f"https://github.com/DuckyPressesButtons/stable-diffusion-webui-aesthetic-image-scorer-and-optimiser/blob/main/scripts/neg_prompts.csv?raw=true"
+    r = requests.get(url)
+    with open(neg_prompt_name, "wb") as f:
+        f.write(r.content)
 
 class AestheticPredictor(nn.Module):
     def __init__(self, input_size):
@@ -318,15 +332,18 @@ def remove_from_prompt(prompt, weight_dict, offset, seen_list = None):
     for i, word in enumerate(prompt_list):
         if word in seen_list:
             seen_list.remove(word)
+        elif word.startswith("~~"):
+            continue
         else:
             removables.append(word)
             removables_weights.append(weights[tags.index(word)])
     if removables_weights:
         random_tag = weighted_choice(removables, removables_weights, offset)
     else:
-        return False
+        return ()
     prompt_list.remove(random_tag)
-    return (list_to_prompt(prompt_list), random_tag)
+    new_prompt = list_to_prompt(prompt_list)
+    return (new_prompt, random_tag)
 
 @dataclass
 class State():
@@ -402,9 +419,9 @@ class Script(scripts.Script):
         use_file_neg       = gr.Checkbox(label = "Use file called neg_prompts.csv instead of box below", value=False)
         tags_txt           = gr.Textbox(label = "Comma separated prompt, untick the above box if used", lines=1, placeholder="tag1,tag2,tag3(include a tag even if only parameter optimising, it won't be used but prevents bugs)")
         neg_tags_txt       = gr.Textbox(label = "Comma separated negative prompt", lines = 1, placeholder = "tag1,tag2,tag3")
-        n_steps            = gr.Number(label = 'Numbers of epochs, total images generated = epochs * batch count', value = 40, precision = 0)
+        n_steps            = gr.Number(label = 'Numbers of epochs, total images generated = epochs * batch count', value = 50, precision = 0)
         min_improvement    = gr.Number(label = 'Minimum score improvement to accept tag', value = 0.05)
-        n_patience         = gr.Number(label = "Return to initial prompt if stuck for n steps, 0 = no restart", value=10, precision = 0)
+        n_patience         = gr.Number(label = "Return to initial prompt if stuck for n steps, 0 = no restart", value=12, precision = 0)
         mem_smoothing      = gr.Number(label = "Tag weight offset n > 0, higher = smaller effect of tag weight", value=0.1)
         add_to_start       = gr.Checkbox(label = "Add to start of prompt instead of end", value = False)
         add_chance         = gr.Number(label = "Relative weight of: adding to prompt, 0 = off", value = 3)
@@ -417,13 +434,12 @@ class Script(scripts.Script):
         cfg_param          = gr.Textbox(label = "CFG Scale", placeholder = "min, max, step")
         denoise_param      = gr.Textbox(label = "Denoise strength", placeholder = "min, max, step")
         samplers_param     = gr.Textbox(label = "Samplers", placeholder = "some_sampler, another_sampler")
-        punc_steps         = gr.Number(label = "Amount of punctuation hacking steps", number = 0)
         return [use_file, use_file_neg, tags_txt, neg_tags_txt, n_steps, min_improvement, n_patience, mem_smoothing, add_to_start, add_chance, remove_chance,
-                    neg_add_chance, neg_remove_chance, param_chance, seed_change_chance, steps_param, cfg_param, denoise_param, samplers_param,punc_steps]
+                    neg_add_chance, neg_remove_chance, param_chance, seed_change_chance, steps_param, cfg_param, denoise_param, samplers_param]
     
     def run(self, p, *args):
         params = ["use_file", "use_file_neg", "tags_txt", "neg_tags_txt", "n_steps", "min_improvement", "n_patience", "mem_smoothing", "add_to_start", "add_chance", "remove_chance",
-                    "neg_add_chance", "neg_remove_chance", "param_chance", "seed_change_chance", "steps_param", "cfg_param", "denoise_param", "samplers_param","punc_steps"]
+                    "neg_add_chance", "neg_remove_chance", "param_chance", "seed_change_chance", "steps_param", "cfg_param", "denoise_param", "samplers_param"]
         self.__dict__.update(dict(zip(params, args)))
         if p.seed == -1:
             p.seed = random.randint(0, 2**32-1)
@@ -443,7 +459,6 @@ class Script(scripts.Script):
         all_states = []
         all_scores = []
         for i in range(self.n_steps):
-            print(cur_state.visited_params)
             processed = process_images(p)
             remove_black_squares(processed)
             scores = get_scores(processed.images)
@@ -466,11 +481,11 @@ class Script(scripts.Script):
                 cur_state = best_state
                 stuck_for += 1
             if (stuck_for < self.n_patience or not self.n_patience) and (successor := self.get_successor_state(cur_state)):
-                print("can_find")
                 prev_state = cur_state
                 cur_state, mode, tag = successor
                 convert_state_to_p(cur_state, p)
             elif self.n_patience and (successor := self.get_successor_state(first_state)):
+                best_state = first_state
                 stuck_for = 0
                 prev_state = first_state
                 cur_state, mode, tag = successor
@@ -564,7 +579,6 @@ class Script(scripts.Script):
         print(f"\nStep:{i}/{self.n_steps} \nCurrent score: {state.score} \n Prompt: {state.prompt} \n Negative Prompt: {state.neg_prompt} \n Params: {state.params} \n Seed: {state.seed}\n")
 
     def get_successor_state(self, state):
-        print(state.visited_params)
         if can_do_action := self.find_valid_action(state):
             mode, result, tag = can_do_action
         else:
@@ -586,10 +600,10 @@ class Script(scripts.Script):
             new_state.visited_neg_removed.append(tag)
             new_state.neg_prompt = result
         if mode == "prompt_remove":
-            state.prompt_removed.append(tag)
+            state.visited_removed.append(tag)
             new_state.prompt = result
         if mode == "neg_prompt_remove":
-            state.neg_prompt_removed.append(tag)
+            state.visited_neg_removed.append(tag)
             new_state.neg_prompt = result
         return (new_state, mode, tag)
 
@@ -612,7 +626,6 @@ class Script(scripts.Script):
         addables = add_to_prompt(state.prompt, self.all_weights["prompt_add"], self.mem_smoothing, state.visited_prompts, self.add_to_start)
         if addables:
             prompt, tag = addables
-            state.visited_prompts.append(tag)
             return ("prompt_add", prompt, tag)
         return ()
 
@@ -620,7 +633,6 @@ class Script(scripts.Script):
         addables = add_to_prompt(state.neg_prompt, self.all_weights["neg_prompt_add"], self.mem_smoothing, state.visited_neg_prompts, self.add_to_start)
         if addables:
             neg_prompt, tag = addables
-            state.visited_neg_prompts.append(tag)
             return ("neg_prompt_add", neg_prompt, tag)
         return ()
 
@@ -629,7 +641,6 @@ class Script(scripts.Script):
             removables = remove_from_prompt(state.prompt, self.all_weights["prompt_remove"], self.mem_smoothing, state.visited_removed)
             if removables:
                 prompt, tag = removables
-                state.visited_removed.append(tag)
                 return ("prompt_remove", prompt, tag)
         return ()
 
@@ -638,7 +649,6 @@ class Script(scripts.Script):
             removables = remove_from_prompt(state.neg_prompt, self.all_weights["neg_prompt_remove"], self.mem_smoothing, state.visited_neg_removed)
             if removables:
                 neg_prompt, tag = removables
-                state.visited_neg_removed.append(tag)
                 return ("neg_prompt_remove", neg_prompt, tag)
         return ()
 
@@ -650,7 +660,6 @@ class Script(scripts.Script):
             param, possible_param_vals = shuffled_params.pop()
             if len(possible_param_vals) == len(state.visited_params[param]):
                 continue
-            print(possible_param_vals, state.visited_params[param])
             new_param_val = pick_unique(possible_param_vals, state.visited_params[param])
             return (param, new_param_val, param)
         return ()

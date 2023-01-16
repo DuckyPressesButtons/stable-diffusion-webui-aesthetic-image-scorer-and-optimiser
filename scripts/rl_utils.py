@@ -2,6 +2,7 @@ import random
 import math
 import os
 import csv
+import re
 
 
 def pick_unique(vals, seen_list = None):
@@ -20,7 +21,9 @@ def remove_whitespace_from_list(c_list):
     return [x for x in c_list if x != ""]
 
 def prompt_length(c_string):
-    return len(comma_sep_to_list(c_string))
+    string_as_list = comma_sep_to_list(c_string)
+    n_double_tilde = re.findall(r"~~", c_string)
+    return len(string_as_list) - len(n_double_tilde)
 
 def random_from_dict(dictionary):
     random_key = random.choice(list(dictionary.keys()))
