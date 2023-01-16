@@ -459,7 +459,13 @@ class Script(scripts.Script):
         all_states = []
         all_scores = []
         for i in range(self.n_steps):
+            original_prompt = p.prompt
+            original_neg_prompt = p.negative_prompt
+            p.prompt = p.prompt.replace("~", "")
+            p.negative_prompt = p.negative_prompt.replace("~", "")
             processed = process_images(p)
+            p.prompt = original_prompt
+            p.negative_prompt = original_neg_prompt
             remove_black_squares(processed)
             scores = get_scores(processed.images)
             all_scores.extend(scores)
